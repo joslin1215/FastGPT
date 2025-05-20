@@ -27,6 +27,9 @@ import { type ChatItemType } from '@fastgpt/global/core/chat/type';
 import type { NodeInputKeyEnum } from '@fastgpt/global/core/workflow/constants';
 import { datasetSearchQueryExtension } from './utils';
 import type { RerankModelItemType } from '@fastgpt/global/core/ai/model.d';
+import { fullTextSearch } from './esSearch';
+import { addLog } from '../../../common/system/log';
+import { ES_ENABLED } from '../../../common/elasticsearch';
 
 export type SearchDatasetDataProps = {
   histories: ChatItemType[];
@@ -544,113 +547,92 @@ export async function searchDatasetData(
       };
     }
 
-    const searchResults = (
-      await Promise.all(
-        datasetIds.map(async (id) => {
-          return MongoDatasetDataText.aggregate(
-            [
-              {
-                $match: {
-                  teamId: new Types.ObjectId(teamId),
-                  datasetId: new Types.ObjectId(id),
-                  $text: { $search: await jiebaSplit({ text: query }) },
-                  ...(filterCollectionIdList
-                    ? {
-                        collectionId: {
-                          $in: filterCollectionIdList.map((id) => new Types.ObjectId(id))
-                        }
-                      }
-                    : {}),
-                  ...(forbidCollectionIdList && forbidCollectionIdList.length > 0
-                    ? {
-                        collectionId: {
-                          $nin: forbidCollectionIdList.map((id) => new Types.ObjectId(id))
-                        }
-                      }
-                    : {})
-                }
-              },
-              {
-                $sort: {
-                  score: { $meta: 'textScore' }
-                }
-              },
-              {
-                $limit: limit
-              },
-              {
-                $project: {
-                  _id: 1,
-                  collectionId: 1,
-                  dataId: 1,
-                  score: { $meta: 'textScore' }
-                }
-              }
-            ],
-            {
-              ...readFromSecondary
+    try {
+      // 使用支持Elasticsearch的函数进行全文搜索
+      const jiebaQuery = await jiebaSplit({ text: query });
+      const { results, usingElasticsearch } = await fullTextSearch({
+        teamId,
+        datasetIds,
+        query: jiebaQuery,
+        limit,
+        forbidCollectionIdList,
+        filterCollectionIdList
+      });
+
+      if (results.length === 0) {
+        return {
+          fullTextRecallResults: [],
+          tokenLen: 0
+        };
+      }
+
+      // 记录ES使用情况
+      addLog.info(`Using ${usingElasticsearch ? 'Elasticsearch' : 'MongoDB'} for full-text search`);
+
+      // Get data and collections
+      const [dataList, collections] = await Promise.all([
+        MongoDatasetData.find(
+          {
+            _id: { $in: results.map((item) => item.dataId) }
+          },
+          '_id datasetId collectionId updateTime q a chunkIndex indexes',
+          { ...readFromSecondary }
+        ).lean(),
+        MongoDatasetCollection.find(
+          {
+            _id: { $in: results.map((item) => item.collectionId) }
+          },
+          '_id name fileId rawLink apiFileId externalFileId externalFileUrl',
+          { ...readFromSecondary }
+        ).lean()
+      ]);
+
+      return {
+        fullTextRecallResults: results
+          .map((item, index) => {
+            const collection = collections.find(
+              (col) => String(col._id) === String(item.collectionId)
+            );
+            if (!collection) {
+              console.log('Collection is not found', item);
+              return;
             }
-          );
-        })
-      )
-    ).flat() as (DatasetDataTextSchemaType & { score: number })[];
+            const data = dataList.find((data) => String(data._id) === String(item.dataId));
+            if (!data) {
+              console.log('Data is not found', item);
+              return;
+            }
 
-    // Get data and collections
-    const [dataList, collections] = await Promise.all([
-      MongoDatasetData.find(
-        {
-          _id: { $in: searchResults.map((item) => item.dataId) }
-        },
-        '_id datasetId collectionId updateTime q a chunkIndex indexes',
-        { ...readFromSecondary }
-      ).lean(),
-      MongoDatasetCollection.find(
-        {
-          _id: { $in: searchResults.map((item) => item.collectionId) }
-        },
-        '_id name fileId rawLink apiFileId externalFileId externalFileUrl',
-        { ...readFromSecondary }
-      ).lean()
-    ]);
-
-    return {
-      fullTextRecallResults: searchResults
-        .map((item, index) => {
-          const collection = collections.find(
-            (col) => String(col._id) === String(item.collectionId)
-          );
-          if (!collection) {
-            console.log('Collection is not found', item);
-            return;
-          }
-          const data = dataList.find((data) => String(data._id) === String(item.dataId));
-          if (!data) {
-            console.log('Data is not found', item);
-            return;
-          }
-
-          return {
-            id: String(data._id),
-            datasetId: String(data.datasetId),
-            collectionId: String(data.collectionId),
-            updateTime: data.updateTime,
-            q: data.q,
-            a: data.a,
-            chunkIndex: data.chunkIndex,
-            indexes: data.indexes,
-            ...getCollectionSourceData(collection),
-            score: [
-              {
-                type: SearchScoreTypeEnum.fullText,
-                value: item.score || 0,
-                index
-              }
-            ]
-          };
-        })
-        .filter(Boolean) as SearchDataResponseItemType[],
-      tokenLen: 0
-    };
+            return {
+              id: String(data._id),
+              datasetId: String(data.datasetId),
+              collectionId: String(data.collectionId),
+              updateTime: data.updateTime,
+              q: data.q,
+              a: data.a,
+              chunkIndex: data.chunkIndex,
+              indexes: data.indexes,
+              ...getCollectionSourceData(collection),
+              score: [
+                {
+                  type: SearchScoreTypeEnum.fullText,
+                  value: item.score || 0,
+                  index
+                }
+              ]
+            };
+          })
+          .filter(Boolean) as SearchDataResponseItemType[],
+        tokenLen: 0
+      };
+    } catch (error) {
+      // 如果搜索过程中出现错误，记录并返回空结果
+      addLog.error('Full-text search error:', error);
+      return {
+        fullTextRecallResults: [],
+        tokenLen: 0
+      };
+    }
   };
   const multiQueryRecall = async ({
     embeddingLimit,
