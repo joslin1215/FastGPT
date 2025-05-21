@@ -19,6 +19,8 @@ import { hashStr } from '@fastgpt/global/common/string/tools';
 import { jiebaSplit } from '../../../common/string/jieba/index';
 import { getCollectionSourceData } from '@fastgpt/global/core/dataset/collection/utils';
 import { Types } from '../../../common/mongo';
+import { getEsClient, checkEsHealth, searchEs } from '../../../common/elasticsearch';
+import { ENABLE_ELASTICSEARCH } from '@fastgpt/global/common/system/config';
 import json5 from 'json5';
 import { MongoDatasetCollectionTags } from '../tag/schema';
 import { readFromSecondary } from '../../../common/mongo/utils';
@@ -527,10 +529,14 @@ export async function searchDatasetData(
     query,
     limit,
     filterCollectionIdList,
+    datasetIds, // Added datasetIds here
+    teamId, // Added teamId here
     forbidCollectionIdList
   }: {
     query: string;
     limit: number;
+    datasetIds: string[]; // Ensure datasetIds is passed
+    teamId: string; // Ensure teamId is passed
     filterCollectionIdList?: string[];
     forbidCollectionIdList: string[];
   }): Promise<{
@@ -544,6 +550,94 @@ export async function searchDatasetData(
       };
     }
 
+    if (ENABLE_ELASTICSEARCH) {
+      try {
+        const esClient = getEsClient();
+        const health = await checkEsHealth();
+
+        if (esClient && health.available) {
+          const esQuery: any = {
+            size: limit,
+            query: {
+              bool: {
+                must: [
+                  {
+                    // Assuming 'text_content' is the field to search in ES
+                    // This can be adjusted to multi_match or other queries as needed
+                    match: {
+                      text_content: query
+                    }
+                  }
+                ],
+                filter: [] as any[]
+              }
+            }
+          };
+
+          if (filterCollectionIdList && filterCollectionIdList.length > 0) {
+            esQuery.query.bool.filter.push({
+              terms: {
+                collectionId: filterCollectionIdList
+              }
+            });
+          }
+          if (forbidCollectionIdList && forbidCollectionIdList.length > 0) {
+            esQuery.query.bool.filter.push({
+              bool: {
+                must_not: {
+                  terms: {
+                    collectionId: forbidCollectionIdList
+                  }
+                }
+              }
+            });
+          }
+          // Ensure datasetIds are also part of the filter if ES index is multi-tenant for datasets
+          if (datasetIds && datasetIds.length > 0) {
+            esQuery.query.bool.filter.push({
+              terms: {
+                datasetId: datasetIds
+              }
+            });
+          }
+
+
+          const esResults = await searchEs('dataset_data', esQuery); // Using 'dataset_data' as index name
+
+          const transformedResults = esResults.hits.hits.map((hit: any, index: number) => {
+            const source = hit._source;
+            return {
+              id: hit._id, // Or source.mongoId if you store the original Mongo ID
+              datasetId: source.datasetId,
+              collectionId: source.collectionId,
+              updateTime: source.updateTime ? new Date(source.updateTime) : new Date(),
+              q: source.q || '',
+              a: source.a || '',
+              chunkIndex: source.chunkIndex || 0,
+              sourceName: source.sourceName || 'Unknown Source', // Fields from getCollectionSourceData
+              fileId: source.fileId,
+              rawLink: source.rawLink,
+              // apiFileId: source.apiFileId, // if available
+              // externalFileId: source.externalFileId, // if available
+              // externalFileUrl: source.externalFileUrl, // if available
+              score: [{ type: SearchScoreTypeEnum.fullText, value: hit._score || 0, index }]
+            };
+          });
+
+          return {
+            fullTextRecallResults: transformedResults,
+            tokenLen: 0 // Placeholder for token length
+          };
+        } else {
+          console.warn('Elasticsearch enabled but not available. Falling back to MongoDB for full-text search.');
+        }
+      } catch (error) {
+        console.error('Error during Elasticsearch full-text search. Falling back to MongoDB.', error);
+      }
+    }
+
+    // Fallback to MongoDB (existing logic)
+    console.log('Fallback to MongoDB for full-text search.');
     const searchResults = (
       await Promise.all(
         datasetIds.map(async (id) => {
@@ -595,7 +689,6 @@ export async function searchDatasetData(
       )
     ).flat() as (DatasetDataTextSchemaType & { score: number })[];
 
-    // Get data and collections
     const [dataList, collections] = await Promise.all([
       MongoDatasetData.find(
         {
@@ -620,13 +713,13 @@ export async function searchDatasetData(
             (col) => String(col._id) === String(item.collectionId)
           );
           if (!collection) {
-            console.log('Collection is not found', item);
-            return;
+            console.log('Collection is not found for item:', item);
+            return null;
           }
           const data = dataList.find((data) => String(data._id) === String(item.dataId));
           if (!data) {
-            console.log('Data is not found', item);
-            return;
+            console.log('Data is not found for item:', item);
+            return null;
           }
 
           return {
@@ -654,10 +747,15 @@ export async function searchDatasetData(
   };
   const multiQueryRecall = async ({
     embeddingLimit,
-    fullTextLimit
+    fullTextLimit,
+    // Make sure datasetIds and teamId are passed to multiQueryRecall or accessible in its scope
+    datasetIds,
+    teamId
   }: {
     embeddingLimit: number;
     fullTextLimit: number;
+    datasetIds: string[];
+    teamId: string;
   }) => {
     // multi query recall
     const embeddingRecallResList: SearchDataResponseItemType[][] = [];
@@ -683,7 +781,9 @@ export async function searchDatasetData(
             query,
             limit: fullTextLimit,
             filterCollectionIdList,
-            forbidCollectionIdList
+            forbidCollectionIdList,
+            datasetIds, // Pass datasetIds
+            teamId // Pass teamId
           })
         ]);
         totalTokens += tokens;
@@ -719,7 +819,9 @@ export async function searchDatasetData(
     tokens: embeddingTokens
   } = await multiQueryRecall({
     embeddingLimit,
-    fullTextLimit
+    fullTextLimit,
+    datasetIds, // Pass datasetIds from searchDatasetData
+    teamId // Pass teamId from searchDatasetData
   });
 
   // ReRank results

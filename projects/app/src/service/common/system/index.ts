@@ -29,6 +29,7 @@ import {
 } from '@/service/core/dataset/apiDataset/controller';
 import { isProVersion } from './constants';
 import { preLoadWorker } from '@fastgpt/service/worker/preload';
+import { initEsSyncQueueAndWorker } from '@fastgpt/service/core/dataset/elasticsearchSync';
 
 export const readConfigData = async (name: string) => {
   const splitName = name.split('.');
@@ -100,6 +101,12 @@ export async function getInitConfig() {
     await preLoadWorker();
   } catch (error) {
     console.error('Preload worker error', error);
+  }
+  try {
+    // Initialize Elasticsearch Sync Worker
+    initEsSyncQueueAndWorker();
+  } catch (error) {
+    console.error('Error initializing Elasticsearch Sync Worker:', error);
   }
 }
 

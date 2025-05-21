@@ -19,7 +19,15 @@ const defaultWorkerOpts: Omit<ConnectionOptions, 'connection'> = {
 };
 
 export enum QueueNames {
-  websiteSync = 'websiteSync'
+  websiteSync = 'websiteSync',
+  elasticsearchSync = 'elasticsearchSync'
+}
+
+// Define payload structure for Elasticsearch sync job
+export interface ElasticsearchSyncJobPayload {
+  mongoDataId: string;
+  // Potentially add action type: 'index', 'update', 'delete' if needed in the future
+  // action: 'index' | 'update' | 'delete'; 
 }
 
 export const queues = (() => {
@@ -82,5 +90,25 @@ export function getWorker<DataType, ReturnType = void>(
   workers.set(name, newWorker);
   return newWorker;
 }
+
+// Helper function to add a job to the Elasticsearch sync queue
+import { ENABLE_ELASTICSEARCH } from '@fastgpt/global/common/system/config';
+
+export const addEsSyncJob = async (mongoDataId: string) => {
+  if (!ENABLE_ELASTICSEARCH) {
+    // Optionally log that ES is disabled and job is not added
+    // addLog.info(`Elasticsearch is disabled. Sync job for ${mongoDataId} not added.`);
+    return;
+  }
+  try {
+    const esSyncQueue = getQueue<ElasticsearchSyncJobPayload>(QueueNames.elasticsearchSync);
+    await esSyncQueue.add('syncMongoDataToEs', { mongoDataId });
+    addLog.info(`Added Elasticsearch sync job for mongoDataId: ${mongoDataId}`);
+  } catch (error) {
+    addLog.error(`Failed to enqueue Elasticsearch sync job for mongoDataId: ${mongoDataId}`, error);
+    // Decide on error handling: re-throw, log, or perhaps add to a retry mechanism if critical
+    // For now, just logging the error.
+  }
+};
 
 export * from 'bullmq';

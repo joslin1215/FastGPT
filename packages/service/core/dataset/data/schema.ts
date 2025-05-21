@@ -111,6 +111,41 @@ try {
   console.log(error);
 }
 
+import { addEsSyncJob } from '../../../common/bullmq';
+import { ENABLE_ELASTICSEARCH } from '@fastgpt/global/common/system/config';
+
+// Middleware to enqueue a job after a new document is saved
+DatasetDataSchema.post('save', async function (doc) {
+  if (ENABLE_ELASTICSEARCH && doc?._id) {
+    try {
+      await addEsSyncJob(doc._id.toString());
+    } catch (error) {
+      console.error(`Failed to enqueue Elasticsearch sync job for saved doc ${doc._id}`, error);
+    }
+  }
+});
+
+// Middleware to enqueue a job after a document is updated via findOneAndUpdate
+DatasetDataSchema.post('findOneAndUpdate', async function (result) {
+  // `this` refers to the query object. `result` is the updated document.
+  // We need to get the document ID from the query or result.
+  // If `result` is null, it means no document was found and updated.
+  if (ENABLE_ELASTICSEARCH && result?._id) {
+    try {
+      // result._id should contain the ID of the updated document
+      await addEsSyncJob(result._id.toString());
+    } catch (error) {
+      console.error(`Failed to enqueue Elasticsearch sync job for updated doc ${result._id}`, error);
+    }
+  } else if (ENABLE_ELASTICSEARCH && !result) {
+    // This case might happen if the update didn't modify any document (e.g., query didn't match)
+    // Or if the operation was a `findOneAndDelete` which also triggers findOneAndUpdate middleware in some drivers/versions.
+    // We might want to log this for debugging if it's unexpected.
+    // console.log('Post findOneAndUpdate called but no document was returned/updated.');
+  }
+});
+
+
 export const MongoDatasetData = getMongoModel<DatasetDataSchemaType>(
   DatasetDataCollectionName,
   DatasetDataSchema
